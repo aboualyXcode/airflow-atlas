@@ -1,0 +1,92 @@
+// Flows play step by step on a map: a token travels from `from` to `to`, the caption explains the
+// step, and `breaks` lists the failures that stop the flow at that step. A step whose `from` and
+// `to` are the same station happens inside that component.
+KA.define("flows", [
+  {
+    id: "task-lifecycle", map: "cluster",
+    title: "A task, from DAG file to success",
+    summary: "The path every task takes in Airflow 3. Learn it once and every stuck or failed task becomes a question of which step stopped.",
+    steps: [
+      { from: "dag-files", to: "dag-processor", title: "Parse the DAG file", note: "The DAG processor imports the file in a subprocess. Module-level code runs on every parse.", breaks: ["dag-import-error", "dag-processing-timeout", "dag-not-appearing"] },
+      { from: "python-env", to: "dag-processor", title: "Import the dependencies", note: "Every provider and library the file imports must be installed.", breaks: ["dependency-conflict", "dag-import-error"] },
+      { from: "dag-processor", to: "metadata-db", title: "Store the serialized DAG", note: "The parsed structure goes to the metadata database; the scheduler never reads your file.", breaks: ["db-connections-exhausted"] },
+      { from: "scheduler", to: "metadata-db", title: "Create the DAG run", note: "When a data interval ends, the scheduler creates a run and finds tasks whose upstreams are done.", breaks: ["dag-run-not-triggered", "catchup-flood", "scheduler-not-running"] },
+      { from: "scheduler", to: "scheduler", title: "Check the limits", note: "Pools, max_active_tasks, max_active_runs and core.parallelism decide what may start now.", breaks: ["pool-slots-exhausted", "sensor-slot-exhaustion"] },
+      { from: "scheduler", to: "executor", title: "Queue the task instance", note: "The task becomes queued and is handed to the executor.", breaks: ["tasks-stuck-queued"] },
+      { from: "executor", to: "broker", title: "Send it to a queue", note: "The Celery executor sends the task to the queue named by its `queue` argument.", breaks: ["broker-unavailable", "tasks-stuck-queued"] },
+      { from: "broker", to: "worker", title: "A worker picks it up", note: "A worker listening on that queue takes it, when it has a free slot.", breaks: ["tasks-stuck-queued"] },
+      { from: "worker", to: "task", title: "Run the task", note: "A supervised process runs your operator and heartbeats while it runs.", breaks: ["task-oom", "zombie-tasks", "execution-timeout", "task-sigterm"] },
+      { from: "task", to: "api-server", title: "Fetch connections and variables", note: "In Airflow 3 tasks talk to Airflow through the Task Execution API, not the database.", breaks: ["connection-not-found", "secrets-access-denied"] },
+      { from: "task", to: "external-systems", title: "Do the work", note: "The operator calls the warehouse, the API or the bucket.", breaks: ["aws-endpoint-timeout", "aws-access-denied", "execution-timeout"] },
+      { from: "task", to: "api-server", title: "Push XComs and report success", note: "Small return values become XComs; the state becomes success and downstream tasks become schedulable.", breaks: ["xcom-too-large"] },
+      { from: "worker", to: "remote-logs", title: "Upload the log", note: "The log goes to remote storage so the UI can show it after the worker is gone.", breaks: ["task-logs-missing"] },
+    ],
+  },
+  {
+    id: "deferral", map: "cluster",
+    title: "A deferrable sensor waits without a worker slot",
+    summary: "How deferral moves waiting out of workers and into one asynchronous process, and what happens when that process is missing.",
+    steps: [
+      { from: "worker", to: "task", title: "The sensor starts", note: "It runs on a worker like any task and checks once.", breaks: [] },
+      { from: "task", to: "task", title: "It defers", note: "Nothing to do yet: it hands a trigger to Airflow and exits, releasing its worker slot.", breaks: ["sensor-slot-exhaustion"] },
+      { from: "task", to: "api-server", title: "State: deferred", note: "The trigger is stored with the task instance.", breaks: [] },
+      { from: "triggerer", to: "metadata-db", title: "The triggerer picks it up", note: "It loads new triggers and runs them in one event loop.", breaks: ["triggerer-not-running"] },
+      { from: "triggerer", to: "external-systems", title: "Wait asynchronously", note: "Thousands of waits share one process; a blocking trigger stalls them all.", breaks: ["triggerer-not-running"] },
+      { from: "triggerer", to: "metadata-db", title: "The event fires", note: "The task instance is scheduled again.", breaks: [] },
+      { from: "scheduler", to: "executor", title: "Resume on a worker", note: "The task continues from where it deferred, using a slot only for the work itself.", breaks: ["pool-slots-exhausted", "tasks-stuck-queued"] },
+    ],
+  },
+  {
+    id: "worker-dies", map: "cluster",
+    title: "A worker dies mid-task",
+    summary: "What Airflow does, and when, after a worker disappears with tasks running on it.",
+    steps: [
+      { from: "worker", to: "worker", title: "t0: the worker disappears", note: "Killed for memory, evicted, its node removed, or stopped by a deploy.", breaks: ["task-oom", "task-sigterm"] },
+      { from: "task", to: "api-server", title: "Heartbeats stop", note: "The running tasks can no longer report.", breaks: ["zombie-tasks"] },
+      { from: "scheduler", to: "metadata-db", title: "t0 + 5 min: the scheduler notices", note: "After the heartbeat timeout it marks those task instances failed.", breaks: ["zombie-tasks"] },
+      { from: "scheduler", to: "executor", title: "Retry, if retries remain", note: "The tasks go back to scheduled and run again on another worker; they must be idempotent.", breaks: ["tasks-stuck-queued"] },
+      { from: "worker", to: "remote-logs", title: "The log may be incomplete", note: "Whatever was not uploaded before the worker died is lost.", breaks: ["task-logs-missing"] },
+    ],
+  },
+  {
+    id: "catchup", map: "cluster",
+    title: "Unpausing a DAG with catchup",
+    summary: "How one switch in the UI can create hundreds of runs, and which limits decide how hard they hit everything else.",
+    steps: [
+      { from: "users", to: "api-server", title: "Unpause the DAG", note: "The DAG has catchup=True and a start_date months ago.", breaks: [] },
+      { from: "scheduler", to: "metadata-db", title: "A run for every missed interval", note: "The scheduler creates runs for each data interval without one.", breaks: ["catchup-flood"] },
+      { from: "scheduler", to: "scheduler", title: "max_active_runs holds some back", note: "Only that many runs are active at once; the rest wait.", breaks: ["catchup-flood"] },
+      { from: "scheduler", to: "executor", title: "Tasks compete for slots", note: "Old runs fill pools and worker slots that today's runs need.", breaks: ["pool-slots-exhausted", "tasks-stuck-queued"] },
+      { from: "task", to: "external-systems", title: "Targets take the load", note: "Warehouses and APIs receive months of work at once.", breaks: ["execution-timeout"] },
+      { from: "scheduler", to: "metadata-db", title: "History grows", note: "Every run adds rows that stay until cleaned.", breaks: ["metadata-db-bloat"] },
+    ],
+  },
+  {
+    id: "aws-mwaa-run", map: "aws",
+    title: "A task runs on Amazon MWAA",
+    summary: "From a commit to a task calling AWS: the bucket, the managed components, the execution role and the logs.",
+    steps: [
+      { from: "dag-files", to: "dag-bucket", title: "Deploy the DAG to S3", note: "CI copies DAG files to the dags/ folder of the environment's bucket.", breaks: ["dag-not-appearing"] },
+      { from: "python-env", to: "dag-bucket", title: "Requirements and plugins", note: "requirements.txt and plugins.zip are versioned objects; changing them updates the environment.", breaks: ["dependency-conflict"] },
+      { from: "dag-bucket", to: "scheduler", title: "MWAA syncs the bucket", note: "Every component receives the DAG files and parses them.", breaks: ["dag-import-error", "dag-processing-timeout"] },
+      { from: "scheduler", to: "broker", title: "Queue the task on SQS", note: "MWAA's Celery executor uses an SQS queue.", breaks: ["tasks-stuck-queued"] },
+      { from: "broker", to: "worker", title: "Workers scale with the queue", note: "MWAA adds workers up to your maximum when tasks wait.", breaks: ["tasks-stuck-queued"] },
+      { from: "worker", to: "iam", title: "Act as the execution role", note: "Every AWS call the task makes uses the execution role.", breaks: ["aws-access-denied"] },
+      { from: "worker", to: "secrets-backend", title: "Read connections from Secrets Manager", note: "The backend reads airflow/connections/<id>.", breaks: ["secrets-access-denied", "connection-not-found"] },
+      { from: "worker", to: "aws-targets", title: "Call Glue, S3, Redshift", note: "Through NAT or VPC endpoints from the private subnets.", breaks: ["aws-endpoint-timeout", "aws-access-denied"] },
+      { from: "worker", to: "remote-logs", title: "Logs to CloudWatch", note: "Task logs go to the task log group, where the UI reads them.", breaks: ["task-logs-missing"] },
+    ],
+  },
+  {
+    id: "aws-network", map: "aws",
+    title: "Reaching services from private subnets",
+    summary: "Every packet a task sends leaves through a private subnet, a security group, and then NAT or an endpoint.",
+    steps: [
+      { from: "worker", to: "vpc", title: "Workers run in private subnets", note: "Two subnets in different zones; no public addresses.", breaks: [] },
+      { from: "worker", to: "security-groups", title: "Pass the security group", note: "Outbound rules must allow the destination; the target must allow the environment's group.", breaks: ["aws-endpoint-timeout"] },
+      { from: "worker", to: "nat", title: "Leave through NAT or an endpoint", note: "Internet destinations need NAT; AWS services can use VPC endpoints.", breaks: ["aws-endpoint-timeout"] },
+      { from: "nat", to: "aws-targets", title: "Reach the service", note: "Without a path, calls hang until the client times out.", breaks: ["aws-endpoint-timeout"] },
+      { from: "users", to: "api-server", title: "Reach the web server", note: "Privately from inside the network, or publicly with an IAM login token.", breaks: [] },
+    ],
+  },
+]);

@@ -1,0 +1,196 @@
+// Incidents replay hop by hop on a map. Each step names the station investigated, the command,
+// what it printed and what that proved. The replay ends with the causal chain: the change at the
+// top, the symptom at the bottom, and contributing factors pointing at the link they enabled.
+// The examples follow Larder, a fictional grocery delivery company running Airflow.
+KA.define("incidents", [
+  {
+    id: "queue-mismatch", map: "cluster", sev: "SEV2",
+    title: "Every ETL task queued, nothing running",
+    when: "Monday 06:05, Airflow on EKS",
+    summary: "The morning ETL has not started. Dozens of tasks across six DAGs sit in queued; the workers report themselves healthy and idle.",
+    rootAt: ["worker"],
+    steps: [
+      {
+        at: "users", title: "Start with what people see",
+        run: "airflow tasks states-for-dag-run orders_daily scheduled__2026-10-12T03:00:00+00:00",
+        output: "extract    queued\ntransform  none\nload       none",
+        finding: "The first task is queued and has been for 3 hours. Next hop: did the scheduler hand it off?",
+        entries: ["tasks-stuck-queued"],
+      },
+      {
+        at: "scheduler", title: "Did the scheduler queue it?",
+        run: "kubectl logs deploy/airflow-scheduler -n airflow --since=4h | grep -A1 'Setting the following tasks to queued state' | head -4",
+        output: "Setting the following tasks to queued state:\n\t<TaskInstance: orders_daily.extract scheduled__2026-10-12T03:00:00+00:00 [scheduled]>\nSending TaskInstanceKey(dag_id='orders_daily', task_id='extract', ...) to CeleryExecutor with priority 3 and queue etl",
+        finding: "Yes: queued and sent to the Celery queue named etl. The scheduler did its part.",
+        entries: [],
+      },
+      {
+        at: "broker", title: "Is the queue being consumed?",
+        run: "redis-cli -h airflow-redis LLEN etl\nredis-cli -h airflow-redis LLEN default",
+        output: "(integer) 187\n(integer) 0",
+        finding: "187 tasks wait on etl; default is empty. Nobody consumes etl.",
+        entries: [],
+      },
+      {
+        at: "worker", title: "Which queues do the workers listen on?",
+        run: "celery --app airflow.providers.celery.executors.celery_executor.app inspect active_queues | grep -o \"'name': '[a-z_]*'\" | sort | uniq -c",
+        output: "      4 'name': 'default'\n      4 'name': 'etl_v2'",
+        finding: "Workers listen on default and etl_v2. Friday's Helm change renamed the worker queue; the DAGs still send to etl.",
+        entries: [],
+      },
+      {
+        at: "worker", title: "Mitigate",
+        run: "helm upgrade airflow apache-airflow/airflow -n airflow --reuse-values --set 'workers.args={bash,-c,exec airflow celery worker --queues default,etl,etl_v2}'",
+        output: "Release \"airflow\" has been upgraded.\netl: 187 -> 0 in 9 minutes",
+        finding: "Workers consume etl again; the backlog drained and the morning DAGs finished 3 hours late.",
+        entries: [],
+      },
+    ],
+    rootCause: "A Helm values change renamed the queue the workers consume, from etl to etl_v2, while DAGs still sent ETL tasks to etl. The scheduler queued them correctly and they waited on a queue no worker read.",
+    chain: {
+      nodes: [
+        { t: "Friday: a Helm change renames the worker queue to etl_v2", kind: "change" },
+        { t: "Workers stop consuming the etl queue" },
+        { t: "The scheduler sends ETL tasks to etl as their DAGs say" },
+        { t: "Tasks wait on a queue nobody reads" },
+        { t: "Monday's ETL queued for 3 hours", kind: "symptom" },
+      ],
+      contributing: [
+        { t: "Queue names defined separately in DAGs and in worker configuration", to: 0 },
+        { t: "No alert on queued tasks or queue length", to: 3 },
+      ],
+    },
+    fixes: [
+      { kind: "Mitigate", text: "Let workers consume etl as well as etl_v2." },
+      { kind: "Fix", text: "Define queue names once, in a module imported by DAGs and rendered into worker configuration." },
+      { kind: "Prevent", text: "Alert when executor.queued_tasks stays high or any queue grows for 15 minutes." },
+    ],
+  },
+  {
+    id: "oom-zombies", map: "cluster", sev: "SEV3",
+    title: "A night of zombies after a new transform",
+    when: "Tuesday 02:00 to 05:00, Airflow on EKS",
+    summary: "Overnight, tasks across unrelated DAGs failed or retried with no error in their logs. By morning, three reports were late.",
+    rootAt: ["task"],
+    steps: [
+      {
+        at: "users", title: "Failures with no error",
+        run: "airflow tasks states-for-dag-run billing_daily scheduled__2026-10-13T01:00:00+00:00",
+        output: "extract   success\ninvoice   up_for_retry\nnotify    upstream_failed",
+        finding: "The invoice log just stops mid-run. Several other DAGs show the same pattern between 02:00 and 05:00.",
+        entries: ["task-logs-missing"],
+      },
+      {
+        at: "scheduler", title: "What does the scheduler say?",
+        run: "kubectl logs deploy/airflow-scheduler -n airflow --since=8h | grep -c 'Detected zombie job'",
+        output: "41",
+        finding: "41 zombies: tasks whose heartbeats stopped. Something killed the processes running them.",
+        entries: ["zombie-tasks"],
+      },
+      {
+        at: "worker", title: "What happened to the workers?",
+        run: "kubectl get pods -n airflow -l component=worker -o custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount,LAST:.status.containerStatuses[0].lastState.terminated.reason",
+        output: "NAME               RESTARTS  LAST\nairflow-worker-0   6         OOMKilled\nairflow-worker-1   5         OOMKilled\nairflow-worker-2   7         OOMKilled",
+        finding: "Every worker was killed for memory several times, taking all the tasks running on it.",
+        entries: ["task-oom"],
+      },
+      {
+        at: "task", title: "Which task eats the memory?",
+        run: "grep -l 'Negsignal.SIGKILL' logs/**/attempt=1.log | sed -E 's|.*dag_id=([^/]*)/.*task_id=([^/]*)/.*|\\1.\\2|' | sort | uniq -c | sort -rn | head -3",
+        output: "     9 marketing_daily.build_audience\n     2 billing_daily.invoice\n     1 orders_daily.load",
+        finding: "build_audience, deployed on Monday, reads 40 million rows into a pandas DataFrame. Each try grows the worker past its 8 GiB limit; the other tasks are collateral.",
+        entries: [],
+      },
+      {
+        at: "kubernetes", title: "Mitigate: isolate the heavy task",
+        run: "# build_audience now runs as a KubernetesPodOperator with 24Gi of memory,\n# and the aggregation moved into a warehouse query",
+        output: "worker restarts since 11:00: 0\nzombies since 11:00: 0",
+        finding: "The other DAGs stopped failing as soon as the heavy task left the shared workers.",
+        entries: [],
+      },
+    ],
+    rootCause: "A new task loaded a large table into memory on shared Celery workers. Each try pushed a worker past its memory limit; Kubernetes killed the worker, and every task on it became a zombie, so unrelated DAGs failed without errors.",
+    chain: {
+      nodes: [
+        { t: "Monday: build_audience loads 40 million rows into pandas", kind: "change" },
+        { t: "A worker passes its 8 GiB memory limit" },
+        { t: "Kubernetes kills the worker: OOMKilled" },
+        { t: "Every task on it stops heartbeating" },
+        { t: "The scheduler fails them as zombies" },
+        { t: "Unrelated DAGs fail overnight with no error", kind: "symptom" },
+      ],
+      contributing: [
+        { t: "Heavy and light tasks share the same workers", to: 1 },
+        { t: "No alert on worker restarts or zombies", to: 4 },
+      ],
+    },
+    fixes: [
+      { kind: "Mitigate", text: "Run the heavy task in its own pod with enough memory." },
+      { kind: "Fix", text: "Push the aggregation into the warehouse instead of pandas." },
+      { kind: "Prevent", text: "A separate queue for memory-heavy tasks; alerts on OOMKilled workers and zombies_killed." },
+    ],
+  },
+  {
+    id: "glue-timeouts", map: "aws", sev: "SEV2",
+    title: "Glue jobs time out after a network cleanup",
+    when: "Wednesday 03:10, Amazon MWAA",
+    summary: "Every task that starts a Glue job fails after hanging for minutes. Tasks that read from S3 still work.",
+    rootAt: ["nat"],
+    steps: [
+      {
+        at: "worker", title: "Read the failing task",
+        run: "aws logs tail airflow-larder-prod-Task --since 1h --filter-pattern ConnectTimeoutError | tail -2",
+        output: "botocore.exceptions.ConnectTimeoutError: Connect timeout on endpoint URL: \"https://glue.eu-west-1.amazonaws.com/\"",
+        finding: "A timeout, not a denial: the request never reached Glue. Next hop: the network path.",
+        entries: ["aws-endpoint-timeout"],
+      },
+      {
+        at: "aws-targets", title: "Is it Glue, or the path to it?",
+        run: "aws glue get-job-runs --job-name orders-transform --max-items 1 --query 'JobRuns[0].[StartedOn,JobRunState]'",
+        output: "[\"2026-10-13T03:02:11Z\", \"SUCCEEDED\"]",
+        finding: "Glue works from outside the VPC. The problem is between the workers and Glue.",
+        entries: [],
+      },
+      {
+        at: "nat", title: "How do the subnets get out?",
+        run: "aws ec2 describe-route-tables --filters Name=association.subnet-id,Values=$SUBNET_A --query 'RouteTables[].Routes[].[DestinationCidrBlock,NatGatewayId,GatewayId]'",
+        output: "[\"10.30.0.0/16\", null, \"local\"]\n[null, null, \"vpce-0s3gateway\"]",
+        finding: "No NAT route any more. Only the local route and the S3 gateway endpoint remain, which is why S3 still works.",
+        entries: [],
+      },
+      {
+        at: "vpc", title: "What changed?",
+        run: "aws cloudtrail lookup-events --lookup-attributes AttributeKey=EventName,AttributeValue=DeleteNatGateway --max-results 1 --query 'Events[0].[EventTime,Username]'",
+        output: "[\"2026-10-12T17:44:03Z\", \"network-cleanup-pipeline\"]",
+        finding: "A cost cleanup removed the NAT gateway the evening before, assuming VPC endpoints covered everything. There is no Glue endpoint.",
+        entries: [],
+      },
+      {
+        at: "nat", title: "Mitigate",
+        run: "aws ec2 create-vpc-endpoint --vpc-id $VPC --vpc-endpoint-type Interface --service-name com.amazonaws.eu-west-1.glue \\\n  --subnet-ids $SUBNET_A $SUBNET_B --security-group-ids $ENDPOINT_SG --private-dns-enabled",
+        output: "VpcEndpoint vpce-0glue... State: pending -> available",
+        finding: "Retried tasks reached Glue through the new endpoint; the backlog finished by 06:30.",
+        entries: [],
+      },
+    ],
+    rootCause: "A network cleanup removed the NAT gateway, assuming VPC endpoints covered all traffic. The environment had no endpoint for Glue, so every Glue call from the workers hung until it timed out, while S3, covered by a gateway endpoint, kept working.",
+    chain: {
+      nodes: [
+        { t: "A cost cleanup deletes the NAT gateway", kind: "change" },
+        { t: "Private subnets keep only the S3 gateway endpoint" },
+        { t: "No path from the workers to Glue" },
+        { t: "Glue calls hang until the client times out" },
+        { t: "Every Glue-starting task fails", kind: "symptom" },
+      ],
+      contributing: [
+        { t: "No inventory of the services DAGs call", to: 0 },
+        { t: "No client timeout shorter than execution_timeout", to: 3 },
+      ],
+    },
+    fixes: [
+      { kind: "Mitigate", text: "Add an interface endpoint for Glue." },
+      { kind: "Fix", text: "Keep endpoints for every service DAGs call in the network code, generated from a list owned with the DAGs." },
+      { kind: "Prevent", text: "A canary DAG that calls each service every hour and alerts on failure." },
+    ],
+  },
+]);
