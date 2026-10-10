@@ -1,0 +1,7 @@
+node_modules/
+dist/
+snapshot-*/
+.DS_Store
+.airflow/
+.venv/
+__pycache__/
