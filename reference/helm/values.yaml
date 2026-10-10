@@ -1,0 +1,22 @@
+# Values for the official Apache Airflow Helm chart on EKS. An example shape; check the keys
+# against the chart version you run.
+executor: CeleryExecutor
+scheduler:
+  replicas: 2                 # one can fail without stopping scheduling
+dagProcessor:
+  enabled: true
+triggerer:
+  replicas: 2                 # deferred tasks depend on it
+workers:
+  replicas: 4
+  resources:
+    requests: { cpu: "1", memory: 4Gi }
+    limits: { memory: 8Gi }
+pgbouncer:
+  enabled: true               # in front of the metadata database
+data:
+  metadataSecretName: airflow-metadata-db   # RDS PostgreSQL connection string
+postgresql:
+  enabled: false
+statsd:
+  enabled: true

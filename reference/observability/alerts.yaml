@@ -1,0 +1,106 @@
+# Prometheus alerting rules for Airflow. Every rule links to the page that explains it.
+# Metric names assume Airflow StatsD metrics through statsd_exporter (prefix airflow) and
+# postgres_exporter for the metadata database; adjust them to your setup. npm test checks the links.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: airflow
+  namespace: monitoring
+spec:
+  groups:
+  - name: scheduling
+    rules:
+    - alert: AirflowSchedulerDown
+      expr: rate(airflow_scheduler_heartbeat[2m]) == 0
+      for: 2m
+      labels:
+        severity: page
+      annotations:
+        summary: 'No scheduler heartbeat for 2 minutes'
+        runbook_url: https://github.com/your-org/airflow-atlas/blob/main/docs/runbooks/scheduler-not-healthy.md
+    - alert: AirflowTasksStarving
+      expr: max(airflow_scheduler_tasks_starving) > 0
+      for: 15m
+      labels:
+        severity: ticket
+      annotations:
+        summary: 'Tasks are waiting for pool or concurrency slots'
+        runbook_url: https://github.com/your-org/airflow-atlas/blob/main/docs/runbooks/tasks-not-running.md
+    - alert: AirflowNoOpenSlots
+      expr: min(airflow_executor_open_slots) == 0
+      for: 15m
+      labels:
+        severity: ticket
+      annotations:
+        summary: 'The executor has had no open slots for 15 minutes'
+        runbook_url: https://github.com/your-org/airflow-atlas/blob/main/docs/failures/pool-slots-exhausted.md
+  - name: parsing
+    rules:
+    - alert: AirflowDagImportErrors
+      expr: max(airflow_dag_processing_import_errors) > 0
+      for: 5m
+      labels:
+        severity: ticket
+      annotations:
+        summary: 'DAG files fail to import'
+        runbook_url: https://github.com/your-org/airflow-atlas/blob/main/docs/runbooks/dag-import-errors.md
+    - alert: AirflowDagParsingSlow
+      expr: max(airflow_dag_processing_total_parse_time) > 60
+      for: 15m
+      labels:
+        severity: ticket
+      annotations:
+        summary: 'Parsing every DAG file takes more than a minute'
+        runbook_url: https://github.com/your-org/airflow-atlas/blob/main/docs/failures/dag-processing-timeout.md
+  - name: execution
+    rules:
+    - alert: AirflowQueuedBacklog
+      expr: max(airflow_executor_queued_tasks) > 50
+      for: 15m
+      labels:
+        severity: ticket
+      annotations:
+        summary: 'More than 50 tasks have been queued for 15 minutes'
+        runbook_url: https://github.com/your-org/airflow-atlas/blob/main/docs/failures/tasks-stuck-queued.md
+    - alert: AirflowTaskFailuresHigh
+      expr: sum(increase(airflow_ti_failures[30m])) > 20
+      for: 0m
+      labels:
+        severity: ticket
+      annotations:
+        summary: 'More than 20 task failures in 30 minutes'
+        runbook_url: https://github.com/your-org/airflow-atlas/blob/main/docs/runbooks/failing-tasks.md
+    - alert: AirflowZombies
+      expr: sum(increase(airflow_zombies_killed[30m])) > 0
+      for: 0m
+      labels:
+        severity: ticket
+      annotations:
+        summary: 'Tasks lost their heartbeats'
+        runbook_url: https://github.com/your-org/airflow-atlas/blob/main/docs/failures/zombie-tasks.md
+    - alert: AirflowTriggererDown
+      expr: rate(airflow_triggerer_heartbeat[2m]) == 0
+      for: 5m
+      labels:
+        severity: ticket
+      annotations:
+        summary: 'No triggerer heartbeat: deferred tasks will not resume'
+        runbook_url: https://github.com/your-org/airflow-atlas/blob/main/docs/failures/triggerer-not-running.md
+  - name: database
+    rules:
+    - alert: AirflowDbConnectionsHigh
+      expr: sum(pg_stat_activity_count{datname="airflow"}) / max(pg_settings_max_connections) > 0.8
+      for: 5m
+      labels:
+        severity: page
+      annotations:
+        summary: 'The metadata database is above 80% of its connections'
+        runbook_url: https://github.com/your-org/airflow-atlas/blob/main/docs/failures/db-connections-exhausted.md
+    - alert: AirflowDbLarge
+      expr: max(pg_database_size_bytes{datname="airflow"}) > 100e9
+      for: 1h
+      labels:
+        severity: ticket
+      annotations:
+        summary: 'The metadata database is larger than 100 GB'
+        runbook_url: https://github.com/your-org/airflow-atlas/blob/main/docs/failures/metadata-db-bloat.md

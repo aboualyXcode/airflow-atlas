@@ -1,0 +1,14 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "PublishMetrics", "Effect": "Allow", "Action": "airflow:PublishMetrics", "Resource": "arn:aws:airflow:eu-west-1:123456789012:environment/larder-prod" },
+    { "Sid": "ReadSourceBucket", "Effect": "Allow", "Action": ["s3:GetObject*", "s3:GetBucket*", "s3:List*"], "Resource": ["arn:aws:s3:::larder-mwaa-prod", "arn:aws:s3:::larder-mwaa-prod/*"] },
+    { "Sid": "WriteLogs", "Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:CreateLogGroup", "logs:PutLogEvents", "logs:GetLogEvents", "logs:GetLogRecord", "logs:GetLogGroupFields", "logs:GetQueryResults"], "Resource": "arn:aws:logs:eu-west-1:123456789012:log-group:airflow-larder-prod-*" },
+    { "Sid": "DescribeLogGroups", "Effect": "Allow", "Action": "logs:DescribeLogGroups", "Resource": "*" },
+    { "Sid": "Metrics", "Effect": "Allow", "Action": "cloudwatch:PutMetricData", "Resource": "*" },
+    { "Sid": "CeleryQueue", "Effect": "Allow", "Action": ["sqs:ChangeMessageVisibility", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:GetQueueUrl", "sqs:ReceiveMessage", "sqs:SendMessage"], "Resource": "arn:aws:sqs:eu-west-1:*:airflow-celery-*" },
+    { "Sid": "QueueEncryption", "Effect": "Allow", "Action": ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey*", "kms:Encrypt"], "NotResource": "arn:aws:kms:*:123456789012:key/*", "Condition": { "StringLike": { "kms:ViaService": ["sqs.eu-west-1.amazonaws.com"] } } },
+    { "Sid": "ReadConnections", "Effect": "Allow", "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"], "Resource": ["arn:aws:secretsmanager:eu-west-1:123456789012:secret:airflow/connections/*", "arn:aws:secretsmanager:eu-west-1:123456789012:secret:airflow/variables/*"] },
+    { "Sid": "RunOrdersTransform", "Effect": "Allow", "Action": ["glue:StartJobRun", "glue:GetJobRun"], "Resource": "arn:aws:glue:eu-west-1:123456789012:job/orders-transform" }
+  ]
+}
